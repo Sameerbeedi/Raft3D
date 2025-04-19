@@ -30,14 +30,23 @@ type KVStore struct {
 }
 
 type FSM struct {
-	data     map[string]string
-	printers map[string]Printer
+	data      map[string]string
+	printers  map[string]Printer
+	filaments map[string]Filament
 }
 
 type Printer struct {
 	ID      string `json:"id"`
 	Company string `json:"company"`
 	Model   string `json:"model"`
+}
+
+type Filament struct {
+	ID                     string `json:"id"`
+	Type                   string `json:"type"`
+	Color                  string `json:"color"`
+	TotalWeightInGrams     int    `json:"total_weight_in_grams"`
+	RemainingWeightInGrams int    `json:"remaining_weight_in_grams"`
 }
 
 type FSMSnapshot struct {
@@ -47,8 +56,9 @@ type FSMSnapshot struct {
 // Modify FSM constructor to initialize printers map
 func NewFSM() *FSM {
 	return &FSM{
-		data:     make(map[string]string),
-		printers: make(map[string]Printer),
+		data:      make(map[string]string),
+		printers:  make(map[string]Printer),
+		filaments: make(map[string]Filament),
 	}
 }
 
@@ -76,6 +86,16 @@ func (f *FSM) Apply(logEntry *raft.Log) interface{} {
 		return nil
 	case "get_printers": // Handle retrieving all printers
 		return f.printers
+	case "add_filament": // Handle adding a filament
+		var filament Filament
+		if err := json.Unmarshal([]byte(cmd.Value), &filament); err != nil {
+			log.Printf("Failed to unmarshal filament: %s", err)
+			return nil
+		}
+		f.filaments[filament.ID] = filament
+		return nil
+	case "get_filaments": // Handle retrieving all filaments
+		return f.filaments
 	default:
 		log.Printf("Unknown command op: %s", cmd.Op)
 		return nil
@@ -332,6 +352,9 @@ func NewHTTPServer(addr string, store *KVStore) *http.Server {
 	// Printer management
 	mux.HandleFunc("/api/v1/printers", httpServer.handlePrinters)
 
+	// Filament management
+	mux.HandleFunc("/api/v1/filaments", httpServer.handleFilaments)
+
 	return &http.Server{
 		Addr:    addr,
 		Handler: mux,
@@ -485,6 +508,71 @@ func (s *HTTPServer) handlePrinters(w http.ResponseWriter, r *http.Request) {
 		}
 
 		json.NewEncoder(w).Encode(printers)
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (k *KVStore) AddFilament(filament Filament) error {
+	if k.raft.State() != raft.Leader {
+		return errors.New("not leader")
+	}
+
+	// Check if the filament already exists
+	if _, exists := k.fsm.filaments[filament.ID]; exists {
+		return fmt.Errorf("filament with ID %s already exists", filament.ID)
+	}
+
+	cmd := Command{
+		Op:    "add_filament",
+		Key:   filament.ID,
+		Value: string(mustMarshal(filament)),
+	}
+
+	data, err := json.Marshal(cmd)
+	if err != nil {
+		return err
+	}
+
+	f := k.raft.Apply(data, 10*time.Second)
+	return f.Error()
+}
+
+func (k *KVStore) GetFilaments() (map[string]Filament, error) {
+	// Allow followers to serve read requests
+	return k.fsm.filaments, nil
+}
+
+func (s *HTTPServer) handleFilaments(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "POST":
+		var filament Filament
+		if err := json.NewDecoder(r.Body).Decode(&filament); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		if err := s.store.AddFilament(filament); err != nil {
+			if strings.Contains(err.Error(), "not leader") {
+				http.Error(w, err.Error(), http.StatusTemporaryRedirect)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusCreated)
+
+	case "GET":
+		// Directly read from the FSM's local state
+		filaments, err := s.store.GetFilaments()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		json.NewEncoder(w).Encode(filaments)
 
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
