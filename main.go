@@ -732,9 +732,8 @@ func (s *HTTPServer) handlePrintJobs(w http.ResponseWriter, r *http.Request) {
     switch r.Method {
     case "POST":
         s.handleCreatePrintJob(w, r)
-    // Add GET later if needed:
-    // case "GET":
-    //  s.handleListPrintJobs(w, r)
+     case "GET":
+	s.handleListPrintJobs(w, r)
     default:
         http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
     }
@@ -787,6 +786,41 @@ func (s *HTTPServer) handleCreatePrintJob(w http.ResponseWriter, r *http.Request
     w.WriteHeader(http.StatusCreated) // 201 Created
     json.NewEncoder(w).Encode(createdJob) // Return the details of the created job
 }
+
+func (s *HTTPServer) handleListPrintJobs(w http.ResponseWriter, r *http.Request) {
+    // Since this is a read operation, any node (leader or follower) can handle it.
+    // We read directly from the FSM state.
+
+    // Get optional status filter from query parameter
+    filterStatus := r.URL.Query().Get("status")
+
+    // Acquire read lock to safely access the FSM state
+    s.store.fsm.mu.RLock()
+    defer s.store.fsm.mu.RUnlock()
+
+    // Create a slice to hold the results
+    var resultJobs []PrintJob
+
+    // Iterate over the print jobs in the FSM
+    for _, job := range s.store.fsm.printJobs {
+        // Apply filter if provided
+        if filterStatus == "" || string(job.Status) == filterStatus {
+             // Check if job.Status needs conversion if filterStatus is string
+             // Assuming job.Status is PrintJobStatus type which might be string alias
+             // Adjust comparison if needed: string(job.Status) == filterStatus
+            resultJobs = append(resultJobs, job)
+        }
+    }
+
+    // Respond with the list of jobs
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusOK)
+    if err := json.NewEncoder(w).Encode(resultJobs); err != nil {
+        log.Printf("Error encoding print jobs list: %v", err)
+        // Don't write error header here as status 200 was already sent
+    }
+}
+
 
 func main() {
 	if len(os.Args) < 4 {
