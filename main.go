@@ -12,10 +12,32 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"sync"
 
 	"github.com/hashicorp/raft"
+	"github.com/google/uuid"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 )
+
+type PrintJobStatus string
+
+const (
+    StatusQueued   PrintJobStatus = "Queued"
+    StatusRunning  PrintJobStatus = "Running"
+    StatusComplete PrintJobStatus = "Complete"
+    StatusFailed   PrintJobStatus = "Failed"
+)
+
+type PrintJob struct {
+    ID                  string         `json:"id"`         // Unique ID for the print job
+    PrinterID           string         `json:"printer_id"` // ID of the printer to use
+    FilamentID          string         `json:"filament_id"`// ID of the filament to use
+    PrintWeightInGrams  int            `json:"print_weight_in_grams"` // Estimated filament weight needed
+    Status              PrintJobStatus `json:"status"`     // Current status (Queued, Running, etc.)
+    CreatedAt           time.Time      `json:"created_at"` // Timestamp when created
+    // Add other relevant fields like file_name, estimated_duration, etc. if needed
+}
+
 
 type Command struct {
 	Op    string `json:"op,omitempty"`
@@ -33,6 +55,8 @@ type FSM struct {
 	data      map[string]string
 	printers  map[string]Printer
 	filaments map[string]Filament
+	printJobs map[string]PrintJob
+	mu sync.RWMutex
 }
 
 type Printer struct {
@@ -59,10 +83,14 @@ func NewFSM() *FSM {
 		data:      make(map[string]string),
 		printers:  make(map[string]Printer),
 		filaments: make(map[string]Filament),
+		printJobs: make(map[string]PrintJob),
 	}
 }
 
 func (f *FSM) Apply(logEntry *raft.Log) interface{} {
+	f.mu.Lock() // Lock for write access
+    	defer f.mu.Unlock()
+
 	var cmd Command
 	if err := json.Unmarshal(logEntry.Data, &cmd); err != nil {
 		log.Printf("Failed to unmarshal command: %s", err)
@@ -96,10 +124,33 @@ func (f *FSM) Apply(logEntry *raft.Log) interface{} {
 		return nil
 	case "get_filaments": // Handle retrieving all filaments
 		return f.filaments
+	case "add_print_job": // Handle adding a print job
+        var job PrintJob
+        if err := json.Unmarshal([]byte(cmd.Value), &job); err != nil {
+            log.Printf("Failed to unmarshal print job: %s", err)
+            return err // Return error to Apply
+        }
+        // Update filament weight (this assumes validation passed before Apply)
+        if filament, ok := f.filaments[job.FilamentID]; ok {
+             // Note: In a real-world scenario, you might only *reserve* the weight
+             // here and deduct it fully when the job status changes to Running.
+             // For simplicity here, we deduct upfront.
+            filament.RemainingWeightInGrams -= job.PrintWeightInGrams
+            f.filaments[job.FilamentID] = filament
+        } else {
+             // This case should ideally not happen if validation works correctly before Apply
+             log.Printf("CRITICAL: Filament %s not found during Apply for job %s", job.FilamentID, job.ID)
+             return fmt.Errorf("filament %s not found during Apply", job.FilamentID)
+        }
+        f.printJobs[job.ID] = job
+        log.Printf("Applied add_print_job for ID: %s", job.ID)
+        return nil // Successfully applied
+
 	default:
 		log.Printf("Unknown command op: %s", cmd.Op)
 		return nil
 	}
+	return nil
 }
 
 func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
@@ -355,6 +406,8 @@ func NewHTTPServer(addr string, store *KVStore) *http.Server {
 	// Filament management
 	mux.HandleFunc("/api/v1/filaments", httpServer.handleFilaments)
 
+	mux.HandleFunc("/api/v1/print_jobs", httpServer.handlePrintJobs)
+
 	return &http.Server{
 		Addr:    addr,
 		Handler: mux,
@@ -544,6 +597,101 @@ func (k *KVStore) GetFilaments() (map[string]Filament, error) {
 	return k.fsm.filaments, nil
 }
 
+// AddPrintJob creates and validates a new print job request
+func (k *KVStore) AddPrintJob(reqJob PrintJob) (*PrintJob, error) {
+    if k.raft.State() != raft.Leader {
+        // Return error or potentially forward the request to the leader
+        leaderAddr := k.raft.Leader()
+        if leaderAddr == "" {
+             return nil, errors.New("cannot create job: no leader available")
+        }
+         // Basic forwarding example (needs implementation):
+         // return forwardRequestToLeader(leaderAddr, "/api/v1/print_jobs", reqJob)
+        return nil, fmt.Errorf("cannot create job: this node (%s) is not the leader (%s)", k.nodeID, leaderAddr)
+    }
+
+    // --- Validation ---
+    k.fsm.mu.RLock() // Read Lock for validation checks
+    defer k.fsm.mu.RUnlock()
+
+    // 1. Check if Printer exists
+    if _, exists := k.fsm.printers[reqJob.PrinterID]; !exists {
+        return nil, fmt.Errorf("validation failed: printer with ID '%s' not found", reqJob.PrinterID)
+    }
+
+    // 2. Check if Filament exists
+    filament, exists := k.fsm.filaments[reqJob.FilamentID]
+    if !exists {
+        return nil, fmt.Errorf("validation failed: filament with ID '%s' not found", reqJob.FilamentID)
+    }
+
+    // 3. Check filament weight
+    // Calculate weight used by other active (Queued/Running) jobs for the same filament
+    committedWeight := 0
+    for _, job := range k.fsm.printJobs {
+        if job.FilamentID == reqJob.FilamentID && (job.Status == StatusQueued || job.Status == StatusRunning) {
+            committedWeight += job.PrintWeightInGrams
+        }
+    }
+
+    availableWeight := filament.RemainingWeightInGrams - committedWeight
+    if reqJob.PrintWeightInGrams <= 0 {
+         return nil, fmt.Errorf("validation failed: print_weight_in_grams must be positive")
+    }
+    if reqJob.PrintWeightInGrams > availableWeight {
+        return nil, fmt.Errorf("validation failed: requested weight %dg exceeds available filament weight %dg (Total: %dg, Committed: %dg)",
+            reqJob.PrintWeightInGrams, availableWeight, filament.RemainingWeightInGrams, committedWeight)
+    }
+    // --- End Validation ---
+
+
+    // --- Create the Job ---
+    // Generate a unique ID for the job
+    jobID := uuid.New().String() // Use UUID for unique IDs
+    newJob := PrintJob{
+        ID:                 jobID,
+        PrinterID:          reqJob.PrinterID,
+        FilamentID:         reqJob.FilamentID,
+        PrintWeightInGrams: reqJob.PrintWeightInGrams,
+        Status:             StatusQueued, // Initialize status to Queued
+        CreatedAt:          time.Now().UTC(),
+    }
+
+
+    // Create Raft command
+    cmd := Command{
+        Op:    "add_print_job",
+        Key:   newJob.ID, // Use job ID as key for simplicity, or keep empty
+        Value: string(mustMarshal(newJob)), // Marshal the full job object
+    }
+
+    data, err := json.Marshal(cmd)
+    if err != nil {
+        log.Printf("Error marshalling add_print_job command: %v", err)
+        return nil, fmt.Errorf("internal server error: failed to create command")
+    }
+
+    // Apply command via Raft
+    applyFuture := k.raft.Apply(data, 10*time.Second)
+    if err := applyFuture.Error(); err != nil {
+         log.Printf("Error applying add_print_job command via Raft: %v", err)
+        return nil, fmt.Errorf("failed to commit print job via Raft: %w", err)
+    }
+
+    // Check Apply response for potential errors from the FSM Apply method itself
+    resp := applyFuture.Response()
+    if applyErr, ok := resp.(error); ok && applyErr != nil {
+        log.Printf("Error returned from FSM Apply for add_print_job: %v", applyErr)
+        return nil, fmt.Errorf("failed to apply print job state change: %w", applyErr)
+    }
+
+
+    log.Printf("Successfully submitted add_print_job command for ID: %s", newJob.ID)
+    // Return the created job structure (reflecting the state *before* FSM applies it)
+    // The FSM will update its state asynchronously.
+    return &newJob, nil
+}
+
 func (s *HTTPServer) handleFilaments(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "POST":
@@ -577,6 +725,67 @@ func (s *HTTPServer) handleFilaments(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+
+func (s *HTTPServer) handlePrintJobs(w http.ResponseWriter, r *http.Request) {
+    switch r.Method {
+    case "POST":
+        s.handleCreatePrintJob(w, r)
+    // Add GET later if needed:
+    // case "GET":
+    //  s.handleListPrintJobs(w, r)
+    default:
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+    }
+}
+
+func (s *HTTPServer) handleCreatePrintJob(w http.ResponseWriter, r *http.Request) {
+    var reqJob PrintJob // Use PrintJob struct directly for input
+
+    // Decode request body
+    if err := json.NewDecoder(r.Body).Decode(&reqJob); err != nil {
+        http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+        return
+    }
+
+     // Basic input sanity checks (beyond FSM validation)
+    if reqJob.PrinterID == "" || reqJob.FilamentID == "" || reqJob.PrintWeightInGrams <= 0 {
+         http.Error(w, "Missing or invalid required fields: printer_id, filament_id, print_weight_in_grams (must be > 0)", http.StatusBadRequest)
+        return
+    }
+    // Ignore any status set by the user
+    reqJob.Status = "" // Clear any status potentially sent by client
+
+
+    // Call the KVStore method to add the job
+    createdJob, err := s.store.AddPrintJob(reqJob)
+    if err != nil {
+        // Check for specific error types (e.g., validation)
+        if strings.Contains(err.Error(), "validation failed:") {
+            http.Error(w, err.Error(), http.StatusConflict) // 409 Conflict for validation errors
+        } else if strings.Contains(err.Error(), "not the leader") {
+             // Handle redirection or leader info hint
+             leader := s.store.GetLeader()
+             if leader != "" {
+                 // Suggest redirecting (client needs to handle this)
+                 w.Header().Set("Location", fmt.Sprintf("http://%s%s", leader, r.URL.Path)) // Assuming leader exposes HTTP on same path
+                 http.Error(w, fmt.Sprintf("Not leader. Current leader is %s. Redirect suggested.", leader), http.StatusTemporaryRedirect) // 307
+             } else {
+                 http.Error(w, "Not leader, and leader unknown.", http.StatusServiceUnavailable) // 503
+             }
+        } else {
+            // General internal errors
+             log.Printf("Error creating print job: %v", err)
+            http.Error(w, fmt.Sprintf("Failed to create print job: %v", err), http.StatusInternalServerError)
+        }
+        return
+    }
+
+    // Success
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusCreated) // 201 Created
+    json.NewEncoder(w).Encode(createdJob) // Return the details of the created job
 }
 
 func main() {
