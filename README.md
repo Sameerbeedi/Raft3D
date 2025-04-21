@@ -41,35 +41,78 @@ The project uses the following main Go modules:
 
 ## Running the Cluster
 
-Each node in the cluster needs to be run as a separate process.
+Each node in the cluster needs to be run as a separate process. You can run the cluster on a single machine or across multiple laptops.
 
-### Starting the First Node (Bootstrapping)
+---
 
-The first node initializes the cluster. Run it without specifying a join address.
+### Running the Cluster Across Laptops
 
-```bash
-# Format: go run ./main.go <node-id> <raft-addr>:<raft-port> :<http-port>
-# Example:
-go run ./main.go node1 127.0.0.1:7000 :8000
-```
+To run the cluster across multiple laptops, ensure all laptops are connected to the same network and have unique IP addresses. Use the following commands:
 
-### Starting Subsequent Nodes (Joining)
+#### **Starting the First Node (Bootstrapping the Cluster)**
 
-Start other nodes and point them to the HTTP address of an *existing* node (preferably the leader) in the cluster using the final argument.
+Run the first node on **Laptop 1** to bootstrap the cluster. Replace `<laptop1-ip>` with the IP address of Laptop 1.
 
 ```bash
-# Format: go run ./main.go <node-id> <raft-addr>:<raft-port> :<http-port> <join-http-addr>:<join-http-port>
-# Example joining node1 (running on HTTP port 8000):
-go run ./main.go node2 127.0.0.1:7001 :8001 127.0.0.1:8000
-go run ./main.go node3 127.0.0.1:7002 :8002 127.0.0.1:8000
+go run main.go node1 <laptop1-ip>:7000 <laptop1-ip>:8000
 ```
 
-**Important Note on Restarting:** Raft saves its state in `./node_<node-id>` directories. If you stop nodes and restart them later, they will attempt to reconnect based on their saved state. When restarting an existing cluster node, *omit* the join address argument.
+#### **Adding More Nodes**
+
+Run additional nodes on other laptops and join them to the cluster. Replace `<laptop2-ip>` with the IP address of Laptop 2, `<laptop3-ip>` with the IP address of Laptop 3, and `<laptop1-ip>` with the IP address of Laptop 1 (the leader).
+
+On **Laptop 2**:
+```bash
+go run main.go node2 <laptop2-ip>:7001 <laptop2-ip>:8001 <laptop1-ip>:8000
+```
+
+On **Laptop 3**:
+```bash
+go run main.go node3 <laptop3-ip>:7002 <laptop3-ip>:8002 <laptop1-ip>:8000
+```
+
+---
+
+### Running the Cluster Locally (Single Machine)
+
+If you want to run the cluster on a single machine, use different ports for each node:
+
+#### **Starting the First Node (Bootstrapping)**
 
 ```bash
-# Example restarting node2 (assuming node1 is also restarting/running):
-go run ./main.go node2 127.0.0.1:7001 :8001
+go run main.go node1 127.0.0.1:7000 :8000
 ```
+
+#### **Adding More Nodes**
+
+```bash
+go run main.go node2 127.0.0.1:7001 :8001 127.0.0.1:8000
+go run main.go node3 127.0.0.1:7002 :8002 127.0.0.1:8000
+```
+
+---
+
+### Important Note on Restarting Nodes
+
+Raft saves its state in `./node_<node-id>` directories. If you stop nodes and restart them later, they will attempt to reconnect based on their saved state. When restarting an existing cluster node, *omit* the join address argument.
+
+```bash
+# Example restarting node2:
+go run main.go node2 <laptop2-ip>:7001 <laptop2-ip>:8001
+```
+
+---
+
+### Verifying the Cluster
+
+Use the `/status` endpoint to verify the cluster setup. For example, on Laptop 1:
+```bash
+curl http://<laptop1-ip>:8000/status
+```
+
+The response will include the leader's address and the list of nodes in the cluster.
+
+---
 
 ## API Endpoints
 
@@ -103,7 +146,7 @@ Interact with the cluster via the HTTP port specified for each node. Write opera
 
 * **`POST /api/v1/printers`**
     * Description: Add a new printer (Leader Only). Duplicates (by ID) are rejected.
-    * Body (JSON): `{"id": "unique_printer_id", "company": "...", "model": "..."}`
+    * Body (JSON): `{"id": "unique_printer_id", "company": "...", "model": "..."}` 
     * Example (`curl`):
         ```bash
         curl -X POST -H "Content-Type: application/json"              -d '{"id": "printer1", "company": "Creality", "model": "Ender 3"}'              http://127.0.0.1:8000/api/v1/printers
@@ -162,6 +205,34 @@ Interact with the cluster via the HTTP port specified for each node. Write opera
         ```bash
         curl -X POST -H "Content-Type: application/json"              -d '{"printer_id": "printer1", "filament_id": "filament1", "print_weight_in_grams": 150}'              http://127.0.0.1:8000/api/v1/print_jobs
         ```
+
+### Print Job Status Management
+
+* **`POST /api/v1/print_jobs/{job_id}/status`**
+    * Description: Update the status of a print job (Leader Only).
+    * Validation:
+        * A job can transition to:
+            - `running` only from the `queued` state.
+            - `done` only from the `running` state.
+            - `canceled` from either the `queued` or `running` state.
+        * No other transitions apart from the ones specified above are allowed.
+    * Behavior:
+        * When transitioning to the `done` state:
+            - The `remaining_weight_in_grams` of the associated filament is reduced by the `print_weight_in_grams` of the current job.
+            - If the filament does not have enough remaining weight, the transition is rejected.
+    * Query Parameter: `status` (required)
+        * Allowed values: `running`, `done`, `canceled`.
+    * Example (`curl`):
+        ```bash
+        curl -X POST "http://127.0.0.1:8000/api/v1/print_jobs/{job_id}/status?status=running"
+        ```
+    * Example Transition Rules:
+        - **Queued → Running**: Valid.
+        - **Running → Done**: Valid.
+        - **Queued → Canceled**: Valid.
+        - **Running → Canceled**: Valid.
+        - **Queued → Done**: Invalid.
+        - **Done → Any State**: Invalid.
 
 ### Basic Key-Value Store
 
